@@ -86,6 +86,7 @@ from gmail.gmail_helpers import (
     format_filter_apply_result,
     html_newlines_to_br,
     html_to_text_preserving_breaks,
+    resolve_outgoing_body,
     update_gmail_filter,
 )
 
@@ -2559,7 +2560,7 @@ async def send_gmail_message(
     body_format: Annotated[
         Literal["plain", "html"],
         Field(
-            description="Format of the body content (and of the prepended note when forwarding). Use 'plain' for plaintext or 'html' for HTML content.",
+            description="Format of the body content (and of the prepended note when forwarding). 'plain' text is escaped and sent as HTML, one <p> per blank-line-separated paragraph, so Gmail never hard-wraps it. Use 'html' for your own markup.",
         ),
     ] = "plain",
     forward_message_id: Annotated[
@@ -2658,7 +2659,7 @@ async def send_gmail_message(
         to (str): Recipient email address.
         subject (str): Email subject. Required unless forwarding (then defaults to 'Fwd: <original subject>').
         body (str): Email body content. Required unless forwarding (then an optional prepended note).
-        body_format (Literal['plain', 'html']): Body format (and prepended note format when forwarding). Defaults to 'plain'.
+        body_format (Literal['plain', 'html']): Body format (and prepended note format when forwarding). Defaults to 'plain', which is escaped and sent as HTML paragraphs.
         forward_message_id (Optional[str]): Gmail message ID to forward. When set, the tool forwards that message.
         include_forwarded_attachments (bool): Whether to carry over the original attachments when forwarding. Defaults to True.
         attachments (Optional[List[Dict[str, str]]]): Optional list of attachments. Each dict can contain:
@@ -2787,6 +2788,8 @@ async def send_gmail_message(
             include_forwarded_attachments=False
         )
     """
+    body, body_format = resolve_outgoing_body(body, body_format)
+
     # Forwarding reuses the original message's content, so it follows a dedicated
     # path that fetches and quotes the source message.
     if forward_message_id:
@@ -3110,11 +3113,16 @@ async def draft_gmail_message(
     service,
     user_google_email: str,
     subject: Annotated[str, Field(description="Email subject.")],
-    body: Annotated[str, Field(description="Email body (plain text).")],
+    body: Annotated[
+        str,
+        Field(
+            description="Email body. With body_format 'plain', separate paragraphs with a blank line; with 'html', use one <p> per paragraph.",
+        ),
+    ],
     body_format: Annotated[
         Literal["plain", "html"],
         Field(
-            description="Email body format. Use 'plain' for plaintext or 'html' for HTML content.",
+            description="Email body format. 'plain' text is escaped and sent as HTML, one <p> per blank-line-separated paragraph, so Gmail never hard-wraps it. Use 'html' for your own markup.",
         ),
     ] = "plain",
     to: Annotated[
@@ -3194,8 +3202,8 @@ async def draft_gmail_message(
     Args:
         user_google_email (str): The user's Google email address. Required for authentication.
         subject (str): Email subject.
-        body (str): Email body (plain text).
-        body_format (Literal['plain', 'html']): Email body format. Defaults to 'plain'.
+        body (str): Email body; blank lines separate paragraphs.
+        body_format (Literal['plain', 'html']): Email body format. Defaults to 'plain', which is escaped and sent as HTML paragraphs.
         to (Optional[str]): Optional recipient email address. Can be left empty for drafts.
         cc (Optional[str]): Optional CC email address.
         bcc (Optional[str]): Optional BCC email address.
@@ -3285,6 +3293,7 @@ async def draft_gmail_message(
     logger.info(
         f"[draft_gmail_message] Invoked. Email: '{user_google_email}', subject_len={len(subject) if subject else 0}"
     )
+    body, body_format = resolve_outgoing_body(body, body_format)
 
     # Prepare the email message. An explicit alias needs no settings lookup when
     # its signature is disabled. Otherwise resolve the identity and signature

@@ -1724,7 +1724,9 @@ async def test_send_gmail_message_preserves_caller_reply_headers():
 
 
 @pytest.mark.asyncio
-async def test_send_gmail_message_quotes_original_when_requested():
+async def test_send_gmail_message_quotes_original_when_requested(monkeypatch):
+    # Covers the text/plain path, which a plain body takes only with the switch off.
+    monkeypatch.setenv("WORKSPACE_MCP_GMAIL_PLAIN_AS_HTML", "false")
     mock_service = _mock_gmail_service()
     mock_service.users().messages().send().execute.return_value = {"id": "sent_reply"}
     mock_service.users().threads().get().execute.return_value = {

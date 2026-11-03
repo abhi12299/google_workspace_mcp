@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 import ssl
 from collections import Counter
@@ -945,6 +946,39 @@ def html_newlines_to_br(html_body: str) -> str:
             rebuilt.append("<br>" * min(piece.count("\n"), 2) + "\n")
         out.append("".join(rebuilt))
     return "".join(out)
+
+
+_PLAIN_AS_HTML_ENV = "WORKSPACE_MCP_GMAIL_PLAIN_AS_HTML"
+_PARAGRAPH_BREAK_RE = re.compile(r"\n(?:[ \t]*\n)+")
+
+
+def plain_text_to_html(text: str) -> str:
+    """Render a plain-text body as HTML: one ``<p>`` per blank-line-separated
+    paragraph, ``<br>`` for a single newline, every character escaped."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    paragraphs = [p.strip() for p in _PARAGRAPH_BREAK_RE.split(normalized) if p.strip()]
+    return "\n".join(
+        "<p>" + "<br>".join(html.escape(line) for line in p.split("\n")) + "</p>"
+        for p in paragraphs
+    )
+
+
+def resolve_outgoing_body(
+    body: Optional[str], body_format: Literal["plain", "html"]
+) -> tuple[Optional[str], Literal["plain", "html"]]:
+    """Send a plain-text body as HTML unless ``WORKSPACE_MCP_GMAIL_PLAIN_AS_HTML``
+    is false.
+
+    Gmail opens a text/plain draft in its Plain text compose mode, which
+    hard-wraps every line at about 70 characters when the draft is sent, and a
+    text/plain message renders with doubled blank lines in the composer. An HTML
+    body with a text/plain alternative has neither problem.
+    """
+    if body_format != "plain" or not body:
+        return body, body_format
+    if os.getenv(_PLAIN_AS_HTML_ENV, "true").strip().lower() in {"0", "false", "no"}:
+        return body, body_format
+    return plain_text_to_html(body), "html"
 
 
 def _signature_html_to_text(signature_html: str) -> str:
