@@ -932,7 +932,8 @@ async def test_draft_gmail_message_quotes_html_reply_with_signature():
     )
 
     assert 'data-smartmail="gmail_signature"' in html_body
-    assert '<div class="gmail_quote">' in html_body
+    assert '<div class="gmail_quote gmail_quote_container">' in html_body
+    assert html_body.index("gmail_signature") < html_body.index("gmail_quote")
 
 
 @pytest.mark.asyncio
@@ -987,6 +988,8 @@ async def test_draft_gmail_message_autofills_reply_headers_from_thread():
         body="Thanks for the update.",
         thread_id="thread123",
         include_signature=False,
+        # Without a quote only headers are needed, so the fetch is trimmed.
+        quote_original=False,
     )
 
     # Verify threads().get() was called with correct parameters

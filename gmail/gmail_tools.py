@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlparse, urlunsplit
 
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import formataddr
+from email.utils import formataddr, parseaddr, parsedate_to_datetime
 
 import httpx
 from fastmcp.exceptions import ToolError as ToolExecutionError
@@ -654,31 +654,54 @@ def _append_signature_to_body(
     return f"{body}{separator}{signature_text}"
 
 
-async def _fetch_original_for_quote(
-    service, thread_id: str, in_reply_to: Optional[str] = None
-) -> Optional[dict]:
-    """Fetch the original message from a thread for quoting in a reply.
+def _format_quote_date(date_header: str) -> str:
+    """Render a Date header in the composer's local time, as Gmail's attribution
+    does ("Fri, 6 Nov 2026 at 11:14 AM"); an unparseable header is kept as is."""
+    try:
+        sent = parsedate_to_datetime(date_header)
+    except (TypeError, ValueError, IndexError):
+        return date_header
+    local = sent.astimezone()
+    hour = local.strftime("%I").lstrip("0")
+    return f"{local:%a}, {local.day} {local:%b %Y} at {hour}:{local:%M %p}"
 
-    When *in_reply_to* is provided the function looks for that specific
-    Message-ID inside the thread.  Otherwise it falls back to the last
-    message in the thread.
 
-    Returns a dict with keys: sender, date, text_body, html_body -- or
-    *None* when the message cannot be retrieved.
-    """
-    context = await _fetch_thread_reply_context(
-        service, thread_id, in_reply_to=in_reply_to, include_bodies=True
+def _quote_attribution(original: dict) -> tuple[str, str]:
+    """Gmail's "On <date>, <sender> wrote:" line, as text and as HTML."""
+    sender = original.get("from") or "unknown"
+    name, address = parseaddr(sender)
+    if "@" in address:
+        text_sender = f"{name} <{address}>" if name else address
+        link = f'<a href="mailto:{html.escape(address)}">{html.escape(address)}</a>'
+        html_sender = f"{html.escape(name)} &lt;{link}&gt;" if name else link
+    else:
+        text_sender, html_sender = sender, html.escape(sender)
+
+    date_header = original.get("date") or ""
+    prefix = f"On {_format_quote_date(date_header)}, " if date_header else ""
+    return (
+        f"{prefix}{text_sender} wrote:",
+        f"{html.escape(prefix)}{html_sender} wrote:",
     )
-    if not context or not context.get("target"):
-        return None
 
-    target = context["target"]
-    return {
-        "sender": target.get("from") or "unknown",
-        "date": target.get("date", ""),
-        "text_body": target.get("text_body", ""),
-        "html_body": target.get("html_body", ""),
-    }
+
+_BODY_OPEN_RE = re.compile(r"<body\b[^>]*>", re.IGNORECASE)
+_CID_IMG_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*[\"']?\s*cid:[^>]*>", re.IGNORECASE)
+
+
+def _quotable_html(message_html: str) -> str:
+    """The part of a message's HTML that belongs inside a quote.
+
+    A full document (Outlook sends one) is cut to its <body> content, so its
+    <head> styles cannot restyle the reply. Inline ``cid:`` images are dropped:
+    their MIME parts are not carried into the reply, so they would render broken.
+    """
+    opening = _BODY_OPEN_RE.search(message_html)
+    if opening:
+        closing = message_html.lower().rfind("</body")
+        end = closing if closing > opening.end() else len(message_html)
+        message_html = message_html[opening.end() : end]
+    return _CID_IMG_RE.sub("", message_html)
 
 
 def _build_quoted_reply_body(
@@ -687,41 +710,37 @@ def _build_quoted_reply_body(
     signature_html: str,
     original: dict,
 ) -> str:
-    """Assemble reply body + signature + quoted original message.
+    """Assemble reply body + signature + the quoted original, in Gmail's format.
 
-    Layout:
-        reply_body
-        -- signature --
-        On {date}, {sender} wrote:
-        > quoted original
+    *original* is a reply-context message (``from``, ``date``, ``text_body``,
+    ``html_body``). The HTML quote uses Gmail's own markup (``gmail_quote``
+    container, ``gmail_attr`` attribution), which Gmail folds behind "..." and
+    other clients show as a quote; the plain quote prefixes each line with ">".
     """
-    if original.get("date"):
-        attribution = f"On {original['date']}, {original['sender']} wrote:"
-    else:
-        attribution = f"{original['sender']} wrote:"
+    text_attribution, html_attribution = _quote_attribution(original)
 
     if body_format == "html":
-        # Signature
         sig_block = ""
         if signature_html and signature_html.strip():
             sig_block = f"<br><br>{_wrap_signature_html(signature_html)}"
 
-        # Quoted original
-        orig_html = original.get("html_body") or ""
-        if not orig_html:
-            orig_text = original.get("text_body", "")
-            orig_html = f"<pre>{html.escape(orig_text)}</pre>"
+        orig_html = _quotable_html(original.get("html_body") or "")
+        if not orig_html.strip():
+            # pre-wrap keeps a text-only original's indentation and aligned
+            # columns while still wrapping long lines.
+            orig_text = html.escape(original.get("text_body") or "")
+            orig_html = f'<div style="white-space:pre-wrap">{orig_text}</div>'
 
         quote_block = (
-            '<br><br><div class="gmail_quote">'
-            f"<span>{html.escape(attribution)}</span><br>"
-            '<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">'
+            '<br><div class="gmail_quote gmail_quote_container">'
+            f'<div dir="ltr" class="gmail_attr">{html_attribution}<br></div>'
+            '<blockquote class="gmail_quote" '
+            'style="margin:0 0 0 .8ex;border-left:1px #ccc solid;padding-left:1ex">'
             f"{orig_html}"
             "</blockquote></div>"
         )
         return f"{reply_body}{sig_block}{quote_block}"
 
-    # Plain text path
     sig_block = ""
     if signature_html and signature_html.strip():
         sig_text = _signature_html_to_text(signature_html).strip()
@@ -729,11 +748,40 @@ def _build_quoted_reply_body(
             sig_block = f"\n\n{sig_text}"
 
     orig_text = original.get("text_body") or ""
-    if not orig_text and original.get("html_body"):
-        orig_text = _html_to_text(original["html_body"])
-    quoted_lines = "\n".join(f"> {line}" for line in orig_text.splitlines())
+    if not orig_text.strip() and original.get("html_body"):
+        orig_text = html_to_text_preserving_breaks(original["html_body"])
+    quoted_lines = "\n".join(
+        f"> {line}" if line.strip() else ">" for line in orig_text.splitlines()
+    )
 
-    return f"{reply_body}{sig_block}\n\n{attribution}\n{quoted_lines}"
+    return f"{reply_body}{sig_block}\n\n{text_attribution}\n{quoted_lines}"
+
+
+def _compose_reply_body(
+    body: str,
+    body_format: Literal["plain", "html"],
+    signature_html: str,
+    quoted: Optional[dict],
+) -> tuple[str, Optional[str]]:
+    """Return the outgoing body, signed and quoting *quoted* when it has content,
+    plus the text/plain alternative an HTML quote needs (else None).
+
+    The alternative is built here rather than flattened from the HTML, so a
+    plain-text reader sees the quote as ">" lines and not as unmarked text.
+    """
+    if not quoted or not (
+        (quoted.get("text_body") or "").strip()
+        or (quoted.get("html_body") or "").strip()
+    ):
+        return _append_signature_to_body(body, body_format, signature_html), None
+
+    quoted_body = _build_quoted_reply_body(body, body_format, signature_html, quoted)
+    if body_format != "html":
+        return quoted_body, None
+    reply_text = html_to_text_preserving_breaks(
+        _append_signature_to_body(body, "html", signature_html)
+    ).strip()
+    return quoted_body, _build_quoted_reply_body(reply_text, "plain", "", quoted)
 
 
 def _format_attachment_result(attached_count: int, requested_count: int) -> str:
@@ -1314,6 +1362,7 @@ def _prepare_gmail_message(
     from_email: Optional[str] = None,
     from_name: Optional[str] = None,
     attachments: Optional[List[Dict[str, str]]] = None,
+    plain_alternative: Optional[str] = None,
 ) -> tuple[str, Optional[str], int, List[str]]:
     """
     Prepare a Gmail message with threading and attachment support.
@@ -1331,6 +1380,8 @@ def _prepare_gmail_message(
         from_email: Optional sender email address
         from_name: Optional sender display name (e.g., "Peter Hartree")
         attachments: Optional list of attachments. Each can have 'path' (file path) OR 'content' (base64) + 'filename'
+        plain_alternative: Optional text/plain part for an HTML body; derived from
+            the HTML when omitted
 
     Returns:
         Tuple of (raw_message, thread_id, attached_count, attachment_errors)
@@ -1384,7 +1435,7 @@ def _prepare_gmail_message(
         # a non-HTML client actually displays, so block boundaries have to
         # survive -- _html_to_text() flattens them and would run paragraphs
         # together ("First paragraph.Second paragraph.").
-        plain_body = html_to_text_preserving_breaks(body).strip()
+        plain_body = plain_alternative or html_to_text_preserving_breaks(body).strip()
         message.set_content(plain_body)
         message.add_alternative(body, subtype="html")
     else:
@@ -2626,9 +2677,9 @@ async def send_gmail_message(
     quote_original: Annotated[
         bool,
         Field(
-            description="Whether to include the message being replied to as a quoted original. Only has an effect when thread_id is provided. Defaults to false.",
+            description="Whether to quote the message being replied to below the reply, as Gmail's composer does, so the recipient keeps the earlier thread. Only has an effect when thread_id is provided. Defaults to true; pass false only to send the new text alone.",
         ),
-    ] = False,
+    ] = True,
     reply_all: Annotated[
         bool,
         Field(
@@ -2690,8 +2741,8 @@ async def send_gmail_message(
             (e.g., missing gmail.settings.basic scope), the send proceeds without a signature.
             Non-benign failures such as quota/rate-limit or API errors raise ToolError and abort
             the send.
-        quote_original (bool): Whether to append the message being replied to as a quoted
-            original. Only has an effect when thread_id is provided.
+        quote_original (bool): Whether to quote the message being replied to below the
+            reply. Only has an effect when thread_id is provided. Defaults to True.
         reply_all (bool): Whether to derive reply-all recipients from the thread: To = the
             sender being replied to, Cc = the other participants, excluding the authenticated
             account and from_email. Requires thread_id. Explicit to/cc win over the derived
@@ -2887,20 +2938,9 @@ async def send_gmail_message(
         # caller's body, before any signature or quoted original is attached.
         body = html_newlines_to_br(body)
 
-    if quote_original and target_reply:
-        send_body_content = _build_quoted_reply_body(
-            body,
-            body_format,
-            signature_html,
-            {
-                "sender": target_reply.get("from") or "unknown",
-                "date": target_reply.get("date", ""),
-                "text_body": target_reply.get("text_body", ""),
-                "html_body": target_reply.get("html_body", ""),
-            },
-        )
-    else:
-        send_body_content = _append_signature_to_body(body, body_format, signature_html)
+    send_body_content, plain_alternative = _compose_reply_body(
+        body, body_format, signature_html, target_reply if quote_original else None
+    )
 
     resolved_attachments = await _resolve_url_attachments(attachments)
     raw_message, thread_id_final, attached_count, attachment_errors = (
@@ -2917,6 +2957,7 @@ async def send_gmail_message(
             from_email=sender_email,
             from_name=from_name,
             attachments=resolved_attachments if resolved_attachments else None,
+            plain_alternative=plain_alternative,
         )
     )
 
@@ -3182,9 +3223,9 @@ async def draft_gmail_message(
     quote_original: Annotated[
         bool,
         Field(
-            description="Whether to include the original message as a quoted reply. Only has an effect when thread_id is provided. Defaults to false.",
+            description="Whether to quote the message being replied to below the reply, as Gmail's composer does, so the recipient keeps the earlier thread. Only has an effect when thread_id is provided. Defaults to true; pass false only to send the new text alone.",
         ),
-    ] = False,
+    ] = True,
 ) -> str:
     """
     Creates a draft email in the user's Gmail account. Supports both new drafts and reply drafts with optional attachments.
@@ -3237,7 +3278,7 @@ async def draft_gmail_message(
             the draft.
         quote_original (bool): Whether to include the original message as a quoted reply.
             Only has an effect when thread_id is provided. When enabled, fetches the
-            original message and appends it below the signature. Defaults to False.
+            original message and appends it below the signature. Defaults to True.
 
     Returns:
         str: Confirmation message with the created draft's ID.
@@ -3337,20 +3378,12 @@ async def draft_gmail_message(
     if thread_id and not subject.strip() and target_reply:
         subject = target_reply.get("subject") or subject
 
-    if quote_original and target_reply:
-        draft_body = _build_quoted_reply_body(
-            draft_body,
-            body_format,
-            signature_html,
-            {
-                "sender": target_reply.get("from") or "unknown",
-                "date": target_reply.get("date", ""),
-                "text_body": target_reply.get("text_body", ""),
-                "html_body": target_reply.get("html_body", ""),
-            },
-        )
-    else:
-        draft_body = _append_signature_to_body(draft_body, body_format, signature_html)
+    draft_body, plain_alternative = _compose_reply_body(
+        draft_body,
+        body_format,
+        signature_html,
+        target_reply if quote_original else None,
+    )
 
     resolved_attachments = await _resolve_url_attachments(attachments)
     raw_message, _thread_id_final, attached_count, attachment_errors = (
@@ -3367,6 +3400,7 @@ async def draft_gmail_message(
             from_email=sender_email,
             from_name=from_name,
             attachments=resolved_attachments,
+            plain_alternative=plain_alternative,
         )
     )
 
